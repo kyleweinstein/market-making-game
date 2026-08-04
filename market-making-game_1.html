@@ -1,0 +1,1505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market Making Game v5</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background-color: #f5f5f5; font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"><div style="padding:24px;text-align:center;">Loading...</div></div>
+  
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+  
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useCallback } = React;
+
+    // ============================================================================
+    // SEEDED RANDOM NUMBER GENERATOR
+    // ============================================================================
+
+    class SeededRandom {
+      constructor(seed) { this.seed = seed; this.state = seed; }
+      next() { this.state = (this.state * 1664525 + 1013904223) % 4294967296; return this.state / 4294967296; }
+      float(min, max) { return min + this.next() * (max - min); }
+      int(min, max) { return Math.floor(this.float(min, max + 1)); }
+      bool() { return this.next() < 0.5; }
+      choice(arr) { return arr[this.int(0, arr.length - 1)]; }
+    }
+
+    // ============================================================================
+    // ORDER BOOK UTILITIES
+    // ============================================================================
+
+    const roundToNickel = (p) => Math.round(p * 20) / 20;
+    const roundToCent = (p) => Math.round(p * 100) / 100;
+
+    function executeMarketOrder(book, side, size) {
+      const levels = side === 'buy' ? [...book.asks] : [...book.bids];
+      let remaining = size, totalCost = 0;
+      const fills = [];
+      for (const lvl of levels) {
+        if (remaining <= 0) break;
+        const fillSize = Math.min(remaining, lvl.size);
+        fills.push({ price: lvl.price, size: fillSize, cost: fillSize * lvl.price });
+        totalCost += fillSize * lvl.price;
+        remaining -= fillSize;
+      }
+      if (remaining > 0) return { fills, avgPrice: null, insufficientLiquidity: true };
+      const avgPrice = totalCost / size;
+      const bestPrice = levels[0] ? levels[0].price : 0;
+      return { fills, avgPrice, totalCost, slippage: side === 'buy' ? avgPrice - bestPrice : bestPrice - avgPrice };
+    }
+
+    function generateOrderBook(basePrice, params, rng) {
+      const levels = params.levels || 5;
+      const sizeMean = params.sizeMean || 200;
+      const sizeStd = params.sizeStd || 100;
+      const spread = params.spread || 0.10;
+      const liquidity = params.liquidity || 'medium';
+      const liqMult = liquidity === 'thin' ? 0.5 : liquidity === 'deep' ? 2.0 : 1.0;
+      const asks = [], bids = [];
+      let askP = basePrice + spread / 2;
+      for (let i = 0; i < levels; i++) {
+        asks.push({ price: roundToNickel(askP), size: Math.max(50, Math.floor((sizeMean + rng.float(-sizeStd, sizeStd)) * liqMult * (1 - i * 0.1))) });
+        askP += rng.float(0.03, 0.12);
+      }
+      let bidP = basePrice - spread / 2;
+      for (let i = 0; i < levels; i++) {
+        bids.push({ price: roundToNickel(bidP), size: Math.max(50, Math.floor((sizeMean + rng.float(-sizeStd, sizeStd)) * liqMult * (1 - i * 0.1))) });
+        bidP -= rng.float(0.03, 0.12);
+      }
+      return { asks, bids, spread: asks[0].price - bids[0].price, bestBid: bids[0].price, bestAsk: asks[0].price, midPrice: (bids[0].price + asks[0].price) / 2 };
+    }
+
+    // ============================================================================
+    // ORDER BOOK TUTORIAL LESSONS
+    // ============================================================================
+
+    const OB_TUTORIAL = [
+      { id: 1, title: "What is an Order Book?", concept: "Bids, asks, and spread", book: { asks: [{ price: 10.15, size: 100 }, { price: 10.10, size: 200 }, { price: 10.05, size: 50 }], bids: [{ price: 10.00, size: 500 }, { price: 9.95, size: 200 }, { price: 9.90, size: 100 }] }, teaching: ["BIDS = buy orders, ASKS = sell orders", "Best bid/ask = top of book", "Spread = best ask - best bid"], question: "What is the spread?", options: ['$0.03', '$0.05', '$0.10', '$0.15'], correct: 1, explanation: "Best Ask ($10.05) - Best Bid ($10.00) = $0.05" },
+      { id: 2, title: "Simple Market Orders", concept: "Executing at best price", book: { asks: [{ price: 10.15, size: 100 }, { price: 10.10, size: 200 }, { price: 10.05, size: 50 }], bids: [{ price: 10.00, size: 500 }] }, teaching: ["Market BUY lifts the best ask", "Market SELL hits the best bid"], question: "Market BUY 50 shares. Price?", options: ['$10.00', '$10.05', '$10.10', '$10.15'], correct: 1, explanation: "You buy at best ask ($10.05)" },
+      { id: 3, title: "Large Orders & Slippage", concept: "Walking the book", book: { asks: [{ price: 10.15, size: 100 }, { price: 10.10, size: 200 }, { price: 10.05, size: 50 }], bids: [{ price: 10.00, size: 500 }] }, teaching: ["Large orders consume multiple levels", "Slippage = avg price vs best price"], question: "Buy 300 shares. Avg price?", options: ['$10.05', '$10.08', '$10.10', '$10.13'], correct: 2, explanation: "50@$10.05 + 200@$10.10 + 50@$10.15 = $10.10 avg" },
+      { id: 4, title: "Selling (Hitting Bids)", concept: "Market sell execution", book: { asks: [{ price: 10.10, size: 100 }], bids: [{ price: 10.00, size: 500 }, { price: 9.95, size: 200 }, { price: 9.90, size: 100 }] }, teaching: ["Selling hits bids from top down", "Large sells push price down"], question: "Sell 800 shares. Avg price?", options: ['$10.00', '$9.98', '$9.95', '$9.90'], correct: 1, explanation: "500@$10.00 + 200@$9.95 + 100@$9.90 = $9.975" },
+      { id: 5, title: "Liquidity Assessment", concept: "Book depth matters", twoBooks: { A: { asks: [{ price: 10.10, size: 100 }], bids: [{ price: 10.00, size: 50 }] }, B: { asks: [{ price: 10.10, size: 1000 }], bids: [{ price: 10.00, size: 2000 }] } }, teaching: ["Depth = total shares at each level", "Deep books = less slippage"], question: "Which has better liquidity?", options: ['Book A', 'Book B', 'Equal', 'Cannot tell'], correct: 1, explanation: "Book B has ~20x more shares" },
+      { id: 6, title: "Limit Orders", concept: "Passive order placement", book: { asks: [{ price: 10.10, size: 200 }, { price: 10.05, size: 50 }], bids: [{ price: 10.00, size: 500 }] }, teaching: ["Limit orders wait in the book", "Inside spread = better priority"], question: "Limit BUY at $10.02. What happens?", options: ['Executes at $10.02', 'Becomes new best bid', 'Rejected', 'Executes at $10.05'], correct: 1, explanation: "$10.02 > $10.00, so it's the new best bid" },
+      { id: 7, title: "Market Maker Positioning", concept: "Capturing spread", book: { asks: [{ price: 10.15, size: 100 }, { price: 10.05, size: 50 }], bids: [{ price: 10.00, size: 500 }] }, teaching: ["Place both bid AND ask", "Inside spread = best priority"], question: "Best quote placement?", options: ['Bid $10.00, Ask $10.05', 'Bid $10.01, Ask $10.04', 'Bid $9.98, Ask $10.15', 'Bid $10.02, Ask $10.03'], correct: 1, explanation: "Inside spread gives priority, profit = $0.03/share" },
+      { id: 8, title: "Adverse Selection", concept: "Informed trader risk", book: { asks: [{ price: 10.04, size: 100 }], bids: [{ price: 10.01, size: 100 }] }, teaching: ["Stale quotes get picked off", "News makes your quotes wrong"], question: "Bad news, value → $9.65. Your $10.01 bid?", options: ['No trades', 'Buy at $10.01, lose $0.36/share', 'Auto-cancels', 'Price moves to $10.01'], correct: 1, explanation: "Informed sellers hit your stale bid!" },
+      { id: 9, title: "Regulatory Impact", concept: "Rules affect liquidity", book: { asks: [{ price: 10.15, size: 25 }, { price: 10.10, size: 50 }, { price: 10.05, size: 75 }], bids: [{ price: 10.00, size: 100 }, { price: 9.95, size: 50 }, { price: 9.90, size: 25 }] }, teaching: ["Min order size removes small traders", "Fewer orders = wider spreads"], question: "Min 100 shares. New spread?", options: ['Narrows', 'Stays $0.05', 'Widens to $0.10', 'Widens to $0.20'], correct: 2, explanation: "Orders <100 removed. New spread = $0.10" },
+      { id: 10, title: "Order Flow Analysis", concept: "Market impact", book: { asks: [{ price: 10.10, size: 1000 }, { price: 10.05, size: 500 }], bids: [{ price: 10.00, size: 1000 }, { price: 9.95, size: 500 }] }, teaching: ["Large orders move markets", "Smart traders split orders"], question: "Buy 1,200 shares. Slippage?", options: ['$0.00', '$0.03/share', '$0.05/share', '$0.08/share'], correct: 1, explanation: "500@$10.05 + 700@$10.10 = $10.079 avg, slippage ~$0.03" },
+    ];
+
+    // Order Book Challenge generators
+    function generateOBQuestion(difficulty, rng) {
+      const types = ['execution', 'liquidity', 'placement'];
+      const type = rng.choice(types);
+      if (type === 'execution') {
+        const basePrice = rng.int(30, 100);
+        const book = generateOrderBook(basePrice, { levels: 4, sizeMean: 150, spread: 0.15 }, rng);
+        const orderSize = Math.floor(book.asks[0].size * rng.float(1.5, 2.5));
+        const side = rng.bool() ? 'buy' : 'sell';
+        const result = executeMarketOrder(book, side, orderSize);
+        const avgPrice = result.avgPrice || basePrice;
+        const fills = result.fills || [];
+        const opts = [avgPrice, book.bestAsk, avgPrice + 0.03, avgPrice - 0.02].map(roundToCent).filter(function(v, i, a) { return a.indexOf(v) === i; }).sort(function(a, b) { return a - b; }).slice(0, 4).map(function(p) { return '$' + p.toFixed(2); });
+        while (opts.length < 4) opts.push('$' + roundToCent(avgPrice + rng.float(-0.1, 0.1)).toFixed(2));
+        var timeLimit = difficulty === 'easy' ? 25 : difficulty === 'medium' ? 35 : 50;
+        return { type: 'execution', book: book, question: 'Market ' + side.toUpperCase() + ' ' + orderSize + ' shares. Avg price?', options: opts, correct: opts.indexOf('$' + roundToCent(avgPrice).toFixed(2)), timeLimit: timeLimit, explanation: fills.map(function(f) { return f.size + '@$' + f.price.toFixed(2); }).join('+') + ' = $' + avgPrice.toFixed(2) };
+      } else if (type === 'liquidity') {
+        const basePrice = rng.int(30, 100);
+        const bookA = generateOrderBook(basePrice, { levels: 3, sizeMean: 100, liquidity: 'thin' }, rng);
+        const bookB = generateOrderBook(basePrice, { levels: 3, sizeMean: 500, liquidity: 'deep' }, rng);
+        const swap = rng.bool();
+        const b1 = swap ? bookB : bookA;
+        const b2 = swap ? bookA : bookB;
+        const depthA = b1.bids.reduce(function(s, l) { return s + l.size; }, 0) + b1.asks.reduce(function(s, l) { return s + l.size; }, 0);
+        const depthB = b2.bids.reduce(function(s, l) { return s + l.size; }, 0) + b2.asks.reduce(function(s, l) { return s + l.size; }, 0);
+        var timeLimit2 = difficulty === 'easy' ? 15 : difficulty === 'medium' ? 20 : 25;
+        return { type: 'liquidity', twoBooks: { A: b1, B: b2 }, question: "Which has deeper liquidity?", options: ['Book A', 'Book B', 'Equal', 'Cannot tell'], correct: depthA > depthB ? 0 : 1, timeLimit: timeLimit2, explanation: 'A: ' + depthA + ' shares, B: ' + depthB + ' shares' };
+      } else {
+        const basePrice = rng.int(40, 120);
+        const spread = roundToNickel(rng.float(0.15, 0.40));
+        const book = generateOrderBook(basePrice, { levels: 3, sizeMean: 200, spread: spread }, rng);
+        const insideBid = roundToCent(book.bestBid + spread * 0.3);
+        var timeLimit3 = difficulty === 'easy' ? 25 : difficulty === 'medium' ? 35 : 45;
+        return { type: 'placement', book: book, question: "Best bid placement for fills?", options: ['$' + (book.bestBid - 0.05).toFixed(2) + ' (below)', '$' + book.bestBid.toFixed(2) + ' (at TOB)', '$' + insideBid.toFixed(2) + ' (inside)', '$' + book.bestAsk.toFixed(2) + ' (crosses)'], correct: 2, timeLimit: timeLimit3, explanation: "Inside spread gives priority" };
+      }
+    }
+
+    function generateOBChallengeSet(difficulty, seed) {
+      const rng = new SeededRandom(seed);
+      const numQ = difficulty === 'easy' ? 10 : difficulty === 'medium' ? 15 : 20;
+      const questions = [];
+      for (let i = 0; i < numQ; i++) { 
+        const q = generateOBQuestion(difficulty, rng); 
+        q.id = difficulty + '_' + i; 
+        questions.push(q); 
+      }
+      return { difficulty: difficulty, questions: questions, seed: seed, createdAt: Date.now() };
+    }
+
+    // Strategy mode parameters
+    const OB_STRATEGY_PARAMS = {
+      easy: { noiseProb: 0.70, informedProb: 0.15, newsProb: 0.05, posLimit: 500 },
+      medium: { noiseProb: 0.60, informedProb: 0.25, newsProb: 0.10, posLimit: 300 },
+      hard: { noiseProb: 0.45, informedProb: 0.40, newsProb: 0.20, posLimit: 150 },
+    };
+
+    function simulateOBStrategyRound(book, playerOrders, trueValue, params, rng) {
+      const events = [];
+      const playerFills = [];
+      let currentTV = trueValue;
+      const numEvents = rng.int(3, 7);
+      for (let i = 0; i < numEvents; i++) {
+        const roll = rng.next();
+        let type;
+        if (roll < params.noiseProb) type = 'noise';
+        else if (roll < params.noiseProb + params.informedProb) type = 'informed';
+        else if (roll < 1 - params.newsProb) type = 'institutional';
+        else type = 'news';
+        
+        if (type === 'news') { 
+          const impact = rng.float(-0.30, 0.30); 
+          currentTV += impact; 
+          events.push({ type: 'news', impact: impact, desc: impact > 0 ? 'Positive news' : 'Negative news' }); 
+          continue; 
+        }
+        const side = type === 'informed' ? (currentTV > book.midPrice ? 'buy' : 'sell') : (rng.bool() ? 'buy' : 'sell');
+        const size = type === 'institutional' ? rng.int(300, 800) : rng.int(50, 200);
+        events.push({ type: type, side: side, size: size, desc: type + ' ' + side + ' ' + size });
+        if (side === 'buy' && playerOrders.ask && playerOrders.ask.price <= book.bestAsk) {
+          playerFills.push({ side: 'sell', price: playerOrders.ask.price, size: Math.min(size, playerOrders.ask.size) });
+        } else if (side === 'sell' && playerOrders.bid && playerOrders.bid.price >= book.bestBid) {
+          playerFills.push({ side: 'buy', price: playerOrders.bid.price, size: Math.min(size, playerOrders.bid.size) });
+        }
+      }
+      return { events: events, playerFills: playerFills, finalTrueValue: currentTV };
+    }
+
+    function calcOBStrategyPnL(fills, finalTV) {
+      let pos = 0, cash = 0;
+      for (let i = 0; i < fills.length; i++) {
+        const f = fills[i];
+        if (f.side === 'buy') { pos += f.size; cash -= f.size * f.price; } 
+        else { pos -= f.size; cash += f.size * f.price; }
+      }
+      return { pnl: cash + pos * finalTV, position: pos, cash: cash };
+    }
+
+    // ============================================================================
+    // GAME CONSTANTS
+    // ============================================================================
+
+    const STARTING_TRUE_VALUE = 100;
+    const MIN_SPREAD = 0.10;
+    const TUTORIAL_ROUNDS = 10;
+    const PRACTICE_ROUNDS = 20;
+    const SCENARIO_ROUNDS = 15;
+
+    const DIFFICULTIES = {
+      easy: { label: 'Easy', noisePct: 0.70, informedPct: 0.15, valuePct: 0.10, arbPct: 0.05, volatility: 0.15, positionLimit: 75, minBots: 1, maxBots: 2, informedEdge: 0.35 },
+      medium: { label: 'Medium', noisePct: 0.55, informedPct: 0.25, valuePct: 0.12, arbPct: 0.08, volatility: 0.20, positionLimit: 50, minBots: 1, maxBots: 3, informedEdge: 0.50 },
+      hard: { label: 'Hard', noisePct: 0.40, informedPct: 0.35, valuePct: 0.15, arbPct: 0.10, volatility: 0.30, positionLimit: 30, minBots: 2, maxBots: 4, informedEdge: 0.70 },
+    };
+
+    const TUTORIAL_CONFIG = [
+      { title: 'Round 1: Introduction', tip: 'You are a market maker. Set BID (buy) and ASK (sell) prices to profit from the spread.', showTrueValue: true, noisePct: 1.0, informedPct: 0, valuePct: 0, arbPct: 0 },
+      { title: 'Round 2: Your First Trade', tip: 'Noise traders buy/sell randomly. Your profit comes from the spread between your bid and ask.', showTrueValue: true, noisePct: 1.0, informedPct: 0, valuePct: 0, arbPct: 0 },
+      { title: 'Round 3: Managing Inventory', tip: 'If you buy more than you sell (positive position), you have inventory risk.', showTrueValue: true, noisePct: 0.9, informedPct: 0.1, valuePct: 0, arbPct: 0 },
+      { title: 'Round 4: Informed Traders', tip: 'Informed traders know the true value and trade against your stale quotes!', showTrueValue: true, noisePct: 0.7, informedPct: 0.3, valuePct: 0, arbPct: 0 },
+      { title: 'Round 5: Value Traders', tip: 'Value traders buy low, sell high. They help correct price when you are wrong.', showTrueValue: true, noisePct: 0.6, informedPct: 0.2, valuePct: 0.2, arbPct: 0 },
+      { title: 'Round 6: Price Discovery', tip: 'True value changes over time. Watch for patterns!', showTrueValue: false, noisePct: 0.6, informedPct: 0.25, valuePct: 0.15, arbPct: 0 },
+      { title: 'Round 7: Spread Adjustment', tip: 'Widen your spread when uncertain. Narrow it to attract more trades.', showTrueValue: false, noisePct: 0.55, informedPct: 0.25, valuePct: 0.15, arbPct: 0.05 },
+      { title: 'Round 8: Position Limits', tip: 'Stay within position limits. Large positions = large risk!', showTrueValue: false, noisePct: 0.55, informedPct: 0.25, valuePct: 0.15, arbPct: 0.05 },
+      { title: 'Round 9: Adverse Selection', tip: 'When informed traders hit you hard, consider widening your spread.', showTrueValue: false, noisePct: 0.50, informedPct: 0.30, valuePct: 0.15, arbPct: 0.05 },
+      { title: 'Round 10: Final Challenge', tip: 'Put it all together! Balance spread, position, and profit.', showTrueValue: false, noisePct: 0.50, informedPct: 0.30, valuePct: 0.15, arbPct: 0.05 },
+    ];
+
+    const SCENARIO_BASES = {
+      highVolatility: { label: '📈 High Volatility', description: 'Wild price swings. Wider spreads recommended.', objective: 'Survive the chaos', volatility: 0.40, noisePct: 0.45, informedPct: 0.35, valuePct: 0.15, arbPct: 0.05, positionLimit: 40 },
+      informedHeavy: { label: '🎯 Shark Tank', description: 'Many informed traders looking to pick you off.', objective: 'Avoid adverse selection', volatility: 0.25, noisePct: 0.35, informedPct: 0.45, valuePct: 0.15, arbPct: 0.05, positionLimit: 35 },
+      tightMarket: { label: '💎 Tight Market', description: 'Low volatility, competitive spreads expected.', objective: 'Profit on thin margins', volatility: 0.10, noisePct: 0.65, informedPct: 0.20, valuePct: 0.10, arbPct: 0.05, positionLimit: 60 },
+      newsDay: { label: '📰 News Day', description: 'Big announcements expected. Prepare for jumps.', objective: 'Navigate the news', volatility: 0.35, noisePct: 0.50, informedPct: 0.30, valuePct: 0.15, arbPct: 0.05, positionLimit: 45, newsProb: 0.3 },
+      arbAttack: { label: '⚡ Arb Attack', description: 'Arbitrageurs are watching your quotes closely.', objective: 'Defend against arb', volatility: 0.20, noisePct: 0.45, informedPct: 0.25, valuePct: 0.10, arbPct: 0.20, positionLimit: 50 },
+    };
+
+    const ACHIEVEMENTS = {
+      firstProfit: { id: 'firstProfit', name: 'First Profit', description: 'Complete a game with positive P&L', icon: '💰' },
+      consistentTrader: { id: 'consistentTrader', name: 'Consistent', description: '5 profitable games in a row', icon: '📈' },
+      disciplined: { id: 'disciplined', name: 'Disciplined', description: 'Never exceed position limit', icon: '🎯' },
+      centuryClub: { id: 'centuryClub', name: 'Century Club', description: 'Earn $100+ in one game', icon: '💎' },
+      graduate: { id: 'graduate', name: 'Graduate', description: 'Complete the tutorial', icon: '🎓' },
+      hardModeVictor: { id: 'hardModeVictor', name: 'Hard Mode Victor', description: 'Profit on hard difficulty', icon: '🏆' },
+      scenarioMaster: { id: 'scenarioMaster', name: 'Scenario Master', description: 'Complete all scenarios profitably', icon: '🌟' },
+      patternMaster: { id: 'patternMaster', name: 'Pattern Master', description: '90%+ on pattern training', icon: '🧠' },
+    };
+
+    const TIERS = [
+      { name: 'Novice', icon: '🌱', advancement: 'Complete tutorial' },
+      { name: 'Apprentice', icon: '📚', advancement: 'Win on medium difficulty' },
+      { name: 'Trader', icon: '📊', advancement: 'Win on hard difficulty' },
+      { name: 'Senior Trader', icon: '💼', advancement: '$500+ lifetime P&L' },
+      { name: 'Market Maker', icon: '👑', advancement: 'Master all scenarios' },
+    ];
+
+    const PATTERN_QUESTIONS = [
+      { id: 1, question: 'You notice 3 consecutive sells at your bid, all for large sizes. What does this suggest?', options: ['Random noise trading', 'Informed traders selling - true value likely lower', 'Technical malfunction', 'Arbitrage opportunity'], correct: 1, explanation: 'Large consecutive sells often indicate informed traders with negative information.' },
+      { id: 2, question: 'Your bid is hit, then immediately your ask is lifted. What happened?', options: ['Two unrelated trades', 'You captured the spread - good!', 'Adverse selection', 'Position limit breach'], correct: 1, explanation: 'When both sides trade, you profit from the spread. This is ideal market making.' },
+      { id: 3, question: 'Your position is +45 (long). The true value suddenly drops. What is your risk?', options: ['No risk - you own stock', 'Large loss - your inventory lost value', 'Profit opportunity', 'Position limit violation'], correct: 1, explanation: 'Long inventory loses value when prices fall. This is inventory risk.' },
+      { id: 4, question: 'True value moved $2.00 in the last 3 rounds. What should you do?', options: ['Narrow spread to attract trades', 'Widen spread to protect against uncertainty', 'Keep spread the same', 'Stop trading'], correct: 1, explanation: 'High volatility means more risk. Widen spreads to compensate.' },
+      { id: 5, question: 'An informed trader knows true value is $102. Your ask is $100.50. What happens?', options: ['They sell to you', 'They buy from you (adverse selection!)', 'No trade occurs', 'They wait for better price'], correct: 1, explanation: 'Informed traders exploit stale quotes. They buy your cheap ask knowing it is underpriced.' },
+    ];
+
+    // ============================================================================
+    // HELPER FUNCTIONS
+    // ============================================================================
+
+    const formatPrice = (price) => price ? price.toFixed(2) : '0.00';
+    const formatPnL = (pnl) => (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    const gaussianRandom = () => { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v); };
+
+    function loadGameData() {
+      try {
+        const saved = localStorage.getItem('marketMakingGameV5');
+        if (saved) {
+          const data = JSON.parse(saved);
+          if (data.sessionHistory && data.sessionHistory.length > 50) data.sessionHistory = data.sessionHistory.slice(-50);
+          return data;
+        }
+      } catch (e) { console.error('Failed to load:', e); }
+      return { sessionHistory: [], achievements: [], tutorialCompleted: false, totalGamesPlayed: 0, scenariosCompleted: {}, consecutiveWins: 0, tier: 0, patternHighScore: 0, obTutorialComplete: false, obTutorialScore: 0, obChallengeScores: {}, obStrategyBestPnL: null };
+    }
+
+    function saveGameData(data) {
+      try {
+        const toSave = Object.assign({}, data);
+        if (toSave.sessionHistory && toSave.sessionHistory.length > 50) toSave.sessionHistory = toSave.sessionHistory.slice(-50);
+        localStorage.setItem('marketMakingGameV5', JSON.stringify(toSave));
+      } catch (e) { console.error('Failed to save:', e); }
+    }
+
+    function isFeatureUnlocked(feature, tier) {
+      const unlockTiers = { hardPractice: 1, patternRecognition: 1, orderBookTraining: 1 };
+      return tier >= (unlockTiers[feature] || 0);
+    }
+
+    function generateRandomScenario(difficulty) {
+      const base = Object.assign({}, DIFFICULTIES[difficulty]);
+      const noise = (Math.random() - 0.5) * 0.15;
+      base.noisePct = Math.max(0.25, Math.min(0.80, base.noisePct + noise));
+      base.informedPct = Math.max(0.10, Math.min(0.50, base.informedPct - noise * 0.5));
+      base.volatility = Math.max(0.08, Math.min(0.45, base.volatility + (Math.random() - 0.5) * 0.15));
+      base.positionLimit = Math.max(20, Math.min(80, base.positionLimit + Math.floor((Math.random() - 0.5) * 20)));
+      base.label = '🎲 Random Mix';
+      base.difficulty = difficulty;
+      return base;
+    }
+
+    // ============================================================================
+    // STYLES
+    // ============================================================================
+
+    const containerStyle = { fontFamily: "'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace", maxWidth: '700px', margin: '0 auto', padding: '24px', backgroundColor: '#fff', minHeight: '100vh' };
+    const buttonStyle = { fontFamily: 'inherit', padding: '12px 24px', fontSize: '14px', border: '2px solid #000', backgroundColor: '#fff', cursor: 'pointer' };
+    const primaryButtonStyle = Object.assign({}, buttonStyle, { backgroundColor: '#000', color: '#fff' });
+    const smallButtonStyle = Object.assign({}, buttonStyle, { padding: '8px 16px', fontSize: '12px' });
+    const inputStyle = { fontFamily: 'inherit', fontSize: '14px', border: '1px solid #000', padding: '10px', boxSizing: 'border-box' };
+
+    // ============================================================================
+    // COMPONENTS
+    // ============================================================================
+
+    function MetricRow(props) {
+      const statusColor = props.status === 'good' ? '#22c55e' : props.status === 'bad' ? '#dc2626' : '#000';
+      return (
+        <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #eee' }}>
+          <span style={{ color: '#666' }}>{props.label}</span>
+          <span style={{ fontWeight: props.highlight ? '600' : '400', color: statusColor }}>{props.value}</span>
+        </div>
+      );
+    }
+
+    function OrderBookDisplay(props) {
+      const book = props.book;
+      const compact = props.compact;
+      if (!book) return null;
+      // Sort asks descending (highest price at top, best/lowest near spread)
+      const asks = (book.asks || []).slice().sort(function(a, b) { return b.price - a.price; });
+      // Sort bids descending (best/highest near spread, lowest at bottom)
+      const bids = (book.bids || []).slice().sort(function(a, b) { return b.price - a.price; });
+      const bestAsk = asks.length > 0 ? Math.min.apply(null, asks.map(function(a) { return a.price; })) : 0;
+      const bestBid = bids.length > 0 ? Math.max.apply(null, bids.map(function(b) { return b.price; })) : 0;
+      const sp = book.spread || (bestAsk && bestBid ? bestAsk - bestBid : 0);
+      const mid = book.midPrice || (bestAsk && bestBid ? (bestAsk + bestBid) / 2 : 0);
+      return (
+        <div style={{ fontSize: compact ? '11px' : '12px', backgroundColor: '#fff', padding: compact ? '10px' : '14px', border: '1px solid #000', marginBottom: '12px' }}>
+          <div style={{ fontWeight: '600', fontSize: '9px', textTransform: 'uppercase', marginBottom: '6px', color: '#666' }}>ASKS (SELL)</div>
+          <div style={{ borderBottom: '2px solid #000', paddingBottom: '6px', marginBottom: '6px' }}>
+            {asks.map(function(l, i) {
+              return (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 4px' }}>
+                  <span style={{ color: '#666' }}>{l.size} shares</span>
+                  <span style={{ fontWeight: '600' }}>@ ${l.price.toFixed(2)}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ textAlign: 'center', padding: '6px', backgroundColor: '#f5f5f5', fontWeight: '600', margin: '6px 0' }}>
+            SPREAD: ${sp.toFixed(2)} <span style={{ fontSize: '10px', color: '#666', fontWeight: '400' }}>Mid: ${mid.toFixed(2)}</span>
+          </div>
+          <div style={{ borderTop: '2px solid #000', paddingTop: '6px' }}>
+            {bids.map(function(l, i) {
+              return (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 4px' }}>
+                  <span style={{ color: '#666' }}>{l.size} shares</span>
+                  <span style={{ fontWeight: '600' }}>@ ${l.price.toFixed(2)}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ fontWeight: '600', fontSize: '9px', textTransform: 'uppercase', marginTop: '6px', color: '#666' }}>BIDS (BUY)</div>
+        </div>
+      );
+    }
+
+    // ============================================================================
+    // MAIN GAME COMPONENT
+    // ============================================================================
+
+    function MarketMakingGame() {
+      const [gamePhase, setGamePhase] = useState('menu');
+      const [gameMode, setGameMode] = useState('normal');
+      const [difficulty, setDifficulty] = useState('medium');
+      const [scenarioType, setScenarioType] = useState(null);
+      const [round, setRound] = useState(1);
+      const [trueValue, setTrueValue] = useState(STARTING_TRUE_VALUE);
+      const [position, setPosition] = useState(0);
+      const [realizedPnL, setRealizedPnL] = useState(0);
+      const [bidPrice, setBidPrice] = useState(99.75);
+      const [askPrice, setAskPrice] = useState(100.25);
+      const [trades, setTrades] = useState([]);
+      const [inventoryEntries, setInventoryEntries] = useState([]);
+      const [roundResult, setRoundResult] = useState(null);
+      const [gameOverReason, setGameOverReason] = useState('');
+      const [scenarioConfig, setScenarioConfig] = useState(null);
+      
+      // Pattern Training state
+      const [patternQuestions, setPatternQuestions] = useState([]);
+      const [patternCurrentQ, setPatternCurrentQ] = useState(0);
+      const [patternAnswers, setPatternAnswers] = useState([]);
+      const [patternShowFeedback, setPatternShowFeedback] = useState(false);
+      const [patternSelectedAnswer, setPatternSelectedAnswer] = useState(null);
+      
+      // ORDER BOOK TRAINING STATE
+      const [obPhase, setObPhase] = useState(null);
+      const [obTutorialLesson, setObTutorialLesson] = useState(0);
+      const [obTutorialAnswers, setObTutorialAnswers] = useState([]);
+      const [obTutorialShowFeedback, setObTutorialShowFeedback] = useState(false);
+      const [obTutorialSelected, setObTutorialSelected] = useState(null);
+      const [obChallengeSet, setObChallengeSet] = useState(null);
+      const [obChallengeQ, setObChallengeQ] = useState(0);
+      const [obChallengeAnswers, setObChallengeAnswers] = useState([]);
+      const [obChallengeTimeLeft, setObChallengeTimeLeft] = useState(0);
+      const [obChallengeShowFeedback, setObChallengeShowFeedback] = useState(false);
+      const [obChallengeSelected, setObChallengeSelected] = useState(null);
+      const [obChallengeDifficulty, setObChallengeDifficulty] = useState('easy');
+      const [obStrategyRound, setObStrategyRound] = useState(1);
+      const [obStrategyBook, setObStrategyBook] = useState(null);
+      const [obStrategyTrueValue, setObStrategyTrueValue] = useState(100);
+      const [obStrategyPnL, setObStrategyPnL] = useState(0);
+      const [obStrategyPosition, setObStrategyPosition] = useState(0);
+      const [obStrategyBid, setObStrategyBid] = useState({ price: '', size: '100' });
+      const [obStrategyAsk, setObStrategyAsk] = useState({ price: '', size: '100' });
+      const [obStrategyRounds, setObStrategyRounds] = useState([]);
+      const [obStrategyEvents, setObStrategyEvents] = useState([]);
+      const [obStrategySeed, setObStrategySeed] = useState(Date.now());
+      const [obStrategyDifficulty, setObStrategyDifficulty] = useState('easy');
+      
+      const [stats, setStats] = useState({ totalTrades: 0, noiseTrades: 0, informedTrades: 0, valueTrades: 0, arbTrades: 0, noisePnL: 0, informedPnL: 0, valuePnL: 0, arbPnL: 0, maxPosition: 0, roundsWithTrades: 0 });
+      const [gameData, setGameData] = useState(function() { return loadGameData(); });
+      const [newAchievements, setNewAchievements] = useState([]);
+
+      const config = (gameMode === 'scenario' || gameMode === 'randomMix') && scenarioConfig ? scenarioConfig : DIFFICULTIES[difficulty];
+      const maxRounds = gameMode === 'tutorial' ? TUTORIAL_ROUNDS : (gameMode === 'scenario' || gameMode === 'randomMix') ? SCENARIO_ROUNDS : PRACTICE_ROUNDS;
+      const tutorialConfig = gameMode === 'tutorial' ? TUTORIAL_CONFIG[round - 1] : null;
+      const spread = askPrice - bidPrice;
+      const totalPnL = realizedPnL + (position * (trueValue - 100));
+      const tier = gameData.tier || 0;
+
+      // Order Book Challenge timer
+      useEffect(function() {
+        if (obPhase === 'challenges' && obChallengeTimeLeft > 0 && !obChallengeShowFeedback) {
+          const timer = setTimeout(function() { setObChallengeTimeLeft(function(t) { return t - 1; }); }, 1000);
+          return function() { clearTimeout(timer); };
+        } else if (obPhase === 'challenges' && obChallengeTimeLeft === 0 && !obChallengeShowFeedback && obChallengeSet) {
+          handleObChallengeAnswer(-1);
+        }
+      }, [obPhase, obChallengeTimeLeft, obChallengeShowFeedback, obChallengeSet]);
+
+      const resetGameState = function() {
+        setRound(1);
+        setTrueValue(STARTING_TRUE_VALUE);
+        setPosition(0);
+        setRealizedPnL(0);
+        setBidPrice(99.75);
+        setAskPrice(100.25);
+        setTrades([]);
+        setInventoryEntries([]);
+        setRoundResult(null);
+        setGameOverReason('');
+        setStats({ totalTrades: 0, noiseTrades: 0, informedTrades: 0, valueTrades: 0, arbTrades: 0, noisePnL: 0, informedPnL: 0, valuePnL: 0, arbPnL: 0, maxPosition: 0, roundsWithTrades: 0 });
+        setNewAchievements([]);
+      };
+
+      const startGame = function(diff, mode, scenario) {
+        resetGameState();
+        setDifficulty(diff);
+        setGameMode(mode);
+        setScenarioType(scenario || null);
+        if (mode === 'scenario' && scenario) {
+          setScenarioConfig(Object.assign({}, SCENARIO_BASES[scenario], { minBots: 1, maxBots: 3 }));
+        } else if (mode === 'randomMix') {
+          setScenarioConfig(generateRandomScenario(diff));
+        } else {
+          setScenarioConfig(null);
+        }
+        setGamePhase('playing');
+      };
+
+      const submitQuotes = function() {
+        if (spread < MIN_SPREAD) {
+          alert('Minimum spread is $' + MIN_SPREAD.toFixed(2));
+          return;
+        }
+        
+        let botConfig;
+        if (gameMode === 'tutorial') {
+          botConfig = Object.assign({}, tutorialConfig, { positionLimit: 100, volatility: 0.15 });
+        } else if (gameMode === 'scenario' || gameMode === 'randomMix') {
+          botConfig = scenarioConfig;
+        } else {
+          botConfig = DIFFICULTIES[difficulty];
+        }
+
+        const minBots = botConfig.minBots !== undefined ? botConfig.minBots : 1;
+        const maxBots = botConfig.maxBots !== undefined ? botConfig.maxBots : 3;
+        const numBots = Math.floor(Math.random() * (maxBots - minBots + 1)) + minBots;
+        
+        const roundTrades = [];
+        let newPosition = position;
+        const newStats = Object.assign({}, stats);
+
+        for (let i = 0; i < numBots; i++) {
+          const rand = Math.random();
+          let botType;
+          if (rand < botConfig.noisePct) botType = 'Noise';
+          else if (rand < botConfig.noisePct + botConfig.informedPct) botType = 'Informed';
+          else if (rand < botConfig.noisePct + botConfig.informedPct + botConfig.valuePct) botType = 'Value';
+          else botType = 'Arbitrageur';
+
+          let trade = null;
+          const edge = botConfig.informedEdge || 0.50;
+
+          if (botType === 'Noise') {
+            const size = 1 + Math.floor(Math.random() * 5);
+            trade = { type: Math.random() > 0.5 ? 'buy' : 'sell', size: size, botType: botType };
+          } else if (botType === 'Informed') {
+            const size = 5 + Math.floor(Math.random() * 6);
+            if (trueValue > askPrice + edge) trade = { type: 'buy', size: size, botType: botType };
+            else if (trueValue < bidPrice - edge) trade = { type: 'sell', size: size, botType: botType };
+          } else if (botType === 'Value') {
+            const size = 2 + Math.floor(Math.random() * 4);
+            const midQuote = (bidPrice + askPrice) / 2;
+            if (midQuote < trueValue - 0.30) trade = { type: 'buy', size: size, botType: botType };
+            else if (midQuote > trueValue + 0.30) trade = { type: 'sell', size: size, botType: botType };
+          } else if (botType === 'Arbitrageur') {
+            const size = 3 + Math.floor(Math.random() * 5);
+            if (askPrice < trueValue - 0.15) trade = { type: 'buy', size: size, botType: botType };
+            else if (bidPrice > trueValue + 0.15) trade = { type: 'sell', size: size, botType: botType };
+          }
+
+          if (trade) {
+            const price = trade.type === 'buy' ? askPrice : bidPrice;
+            const pnl = trade.type === 'buy' ? (price - trueValue) * trade.size : (trueValue - price) * trade.size;
+            trade.price = price;
+            trade.pnl = pnl;
+            roundTrades.push(trade);
+
+            if (trade.type === 'buy') newPosition -= trade.size;
+            else newPosition += trade.size;
+
+            newStats.totalTrades++;
+            if (botType === 'Noise') { newStats.noiseTrades++; newStats.noisePnL += pnl; }
+            else if (botType === 'Informed') { newStats.informedTrades++; newStats.informedPnL += pnl; }
+            else if (botType === 'Value') { newStats.valueTrades++; newStats.valuePnL += pnl; }
+            else { newStats.arbTrades++; newStats.arbPnL += pnl; }
+          }
+        }
+
+        if (roundTrades.length > 0) newStats.roundsWithTrades++;
+        newStats.maxPosition = Math.max(newStats.maxPosition, Math.abs(newPosition));
+
+        const effectiveVolatility = botConfig.volatility || 0.20;
+        const newTrueValue = trueValue + gaussianRandom() * effectiveVolatility;
+
+        const roundData = {
+          round: round,
+          trades: roundTrades,
+          trueValue: trueValue,
+          newTrueValue: newTrueValue,
+          bid: bidPrice,
+          ask: askPrice,
+          position: newPosition,
+        };
+
+        setTrades(roundTrades);
+        setPosition(newPosition);
+        setStats(newStats);
+        setTrueValue(newTrueValue);
+        setRoundResult(roundData);
+        setGamePhase('results');
+      };
+
+      const nextRound = function() {
+        const posLimit = config ? config.positionLimit : 50;
+        if (Math.abs(position) > posLimit) {
+          setGameOverReason('Position limit exceeded! Max: ±' + posLimit);
+          setGamePhase('gameover');
+          return;
+        }
+        if (round >= maxRounds) {
+          finishGame();
+          return;
+        }
+        setRound(round + 1);
+        setRoundResult(null);
+        setTrades([]);
+        setGamePhase('playing');
+      };
+
+      const finishGame = function() {
+        const finalPnL = totalPnL;
+        const achievements = gameData.achievements ? gameData.achievements.slice() : [];
+        const newAch = [];
+        let consecutiveWins = gameData.consecutiveWins || 0;
+        const scenariosCompleted = Object.assign({}, gameData.scenariosCompleted || {});
+        
+        if (finalPnL > 0) {
+          consecutiveWins++;
+          if (achievements.indexOf('firstProfit') === -1) { achievements.push('firstProfit'); newAch.push(ACHIEVEMENTS.firstProfit); }
+        } else {
+          consecutiveWins = 0;
+        }
+        
+        if (consecutiveWins >= 5 && achievements.indexOf('consistentTrader') === -1) { achievements.push('consistentTrader'); newAch.push(ACHIEVEMENTS.consistentTrader); }
+        if (stats.maxPosition < (config.positionLimit || 50) && achievements.indexOf('disciplined') === -1) { achievements.push('disciplined'); newAch.push(ACHIEVEMENTS.disciplined); }
+        if (finalPnL >= 100 && achievements.indexOf('centuryClub') === -1) { achievements.push('centuryClub'); newAch.push(ACHIEVEMENTS.centuryClub); }
+        if (gameMode === 'tutorial' && achievements.indexOf('graduate') === -1) { achievements.push('graduate'); newAch.push(ACHIEVEMENTS.graduate); }
+        if (difficulty === 'hard' && finalPnL > 0 && achievements.indexOf('hardModeVictor') === -1) { achievements.push('hardModeVictor'); newAch.push(ACHIEVEMENTS.hardModeVictor); }
+        
+        if (gameMode === 'scenario' && scenarioType && finalPnL > 0) {
+          scenariosCompleted[scenarioType] = true;
+          const allDone = Object.keys(SCENARIO_BASES).every(function(k) { return scenariosCompleted[k]; });
+          if (allDone && achievements.indexOf('scenarioMaster') === -1) { achievements.push('scenarioMaster'); newAch.push(ACHIEVEMENTS.scenarioMaster); }
+        }
+        
+        setNewAchievements(newAch);
+        
+        const session = {
+          id: Date.now(),
+          mode: gameMode,
+          difficulty: difficulty,
+          scenarioType: scenarioType,
+          finalPnL: finalPnL,
+          rounds: round,
+          date: new Date().toISOString(),
+        };
+        
+        let newTier = gameData.tier || 0;
+        if (newTier === 0 && gameMode === 'tutorial') newTier = 1;
+        else if (newTier === 1 && difficulty === 'medium' && finalPnL > 0) newTier = 2;
+        else if (newTier === 2 && difficulty === 'hard' && finalPnL > 0) newTier = 3;
+        
+        const updatedData = {
+          sessionHistory: (gameData.sessionHistory || []).concat([session]).slice(-50),
+          achievements: achievements,
+          tutorialCompleted: gameData.tutorialCompleted || gameMode === 'tutorial',
+          totalGamesPlayed: (gameData.totalGamesPlayed || 0) + 1,
+          consecutiveWins: consecutiveWins,
+          scenariosCompleted: scenariosCompleted,
+          tier: newTier,
+          patternHighScore: gameData.patternHighScore || 0,
+          obTutorialComplete: gameData.obTutorialComplete || false,
+          obTutorialScore: gameData.obTutorialScore || 0,
+          obChallengeScores: gameData.obChallengeScores || {},
+          obStrategyBestPnL: gameData.obStrategyBestPnL,
+        };
+        
+        setGameData(updatedData);
+        saveGameData(updatedData);
+        setGamePhase('gameover');
+      };
+
+      // Pattern Training
+      const startPatternTraining = function() {
+        const shuffled = PATTERN_QUESTIONS.slice().sort(function() { return Math.random() - 0.5; });
+        setPatternQuestions(shuffled);
+        setPatternCurrentQ(0);
+        setPatternAnswers([]);
+        setPatternShowFeedback(false);
+        setPatternSelectedAnswer(null);
+        setNewAchievements([]);
+        setGamePhase('patternTraining');
+      };
+
+      const handlePatternAnswer = function(idx) {
+        const q = patternQuestions[patternCurrentQ];
+        const correct = idx === q.correct;
+        setPatternSelectedAnswer(idx);
+        setPatternAnswers(patternAnswers.concat([{ questionId: q.id, answer: idx, correct: correct }]));
+        setPatternShowFeedback(true);
+      };
+
+      const nextPatternQuestion = function() {
+        if (patternCurrentQ < patternQuestions.length - 1) {
+          setPatternCurrentQ(patternCurrentQ + 1);
+          setPatternShowFeedback(false);
+          setPatternSelectedAnswer(null);
+        } else {
+          const correctCount = patternAnswers.filter(function(a) { return a.correct; }).length;
+          const score = Math.round((correctCount / patternQuestions.length) * 100);
+          const newAch = [];
+          const achievements = gameData.achievements ? gameData.achievements.slice() : [];
+          if (score >= 90 && achievements.indexOf('patternMaster') === -1) {
+            achievements.push('patternMaster');
+            newAch.push(ACHIEVEMENTS.patternMaster);
+          }
+          const updatedData = Object.assign({}, gameData, { 
+            patternHighScore: Math.max(gameData.patternHighScore || 0, score), 
+            achievements: achievements 
+          });
+          setGameData(updatedData);
+          saveGameData(updatedData);
+          setNewAchievements(newAch);
+          setGamePhase('patternComplete');
+        }
+      };
+
+      // Order Book Training Functions
+      const startObTutorial = function() {
+        setObTutorialLesson(0);
+        setObTutorialAnswers([]);
+        setObTutorialShowFeedback(false);
+        setObTutorialSelected(null);
+        setObPhase('tutorial');
+        setGamePhase('orderBook');
+      };
+
+      const handleObTutorialAnswer = function(idx) {
+        const lesson = OB_TUTORIAL[obTutorialLesson];
+        const correct = idx === lesson.correct;
+        setObTutorialSelected(idx);
+        setObTutorialAnswers(obTutorialAnswers.concat([{ lessonId: lesson.id, answer: idx, correct: correct }]));
+        setObTutorialShowFeedback(true);
+      };
+
+      const nextObTutorialLesson = function() {
+        if (obTutorialLesson < OB_TUTORIAL.length - 1) {
+          setObTutorialLesson(obTutorialLesson + 1);
+          setObTutorialShowFeedback(false);
+          setObTutorialSelected(null);
+        } else {
+          const correctCount = obTutorialAnswers.filter(function(a) { return a.correct; }).length;
+          const score = Math.round((correctCount / OB_TUTORIAL.length) * 100);
+          const updatedData = Object.assign({}, gameData, { obTutorialComplete: true, obTutorialScore: Math.max(gameData.obTutorialScore || 0, score) });
+          setGameData(updatedData);
+          saveGameData(updatedData);
+          setObPhase('tutorialComplete');
+        }
+      };
+
+      const startObChallenges = function(diff) {
+        setObChallengeDifficulty(diff);
+        const seed = Date.now();
+        const set = generateOBChallengeSet(diff, seed);
+        setObChallengeSet(set);
+        setObChallengeQ(0);
+        setObChallengeAnswers([]);
+        setObChallengeShowFeedback(false);
+        setObChallengeSelected(null);
+        setObChallengeTimeLeft(set.questions[0].timeLimit);
+        setObPhase('challenges');
+        setGamePhase('orderBook');
+      };
+
+      const handleObChallengeAnswer = function(idx) {
+        if (!obChallengeSet) return;
+        const q = obChallengeSet.questions[obChallengeQ];
+        const correct = idx === q.correct;
+        setObChallengeSelected(idx);
+        const points = correct ? 10 + (obChallengeTimeLeft > 10 ? 2 : 0) : 0;
+        setObChallengeAnswers(obChallengeAnswers.concat([{ id: q.id, correct: correct, points: points }]));
+        setObChallengeShowFeedback(true);
+      };
+
+      const nextObChallenge = function() {
+        if (!obChallengeSet) return;
+        if (obChallengeQ < obChallengeSet.questions.length - 1) {
+          const nextQ = obChallengeQ + 1;
+          setObChallengeQ(nextQ);
+          setObChallengeShowFeedback(false);
+          setObChallengeSelected(null);
+          setObChallengeTimeLeft(obChallengeSet.questions[nextQ].timeLimit);
+        } else {
+          const correctCount = obChallengeAnswers.filter(function(a) { return a.correct; }).length;
+          const score = Math.round((correctCount / obChallengeSet.questions.length) * 100);
+          const scores = Object.assign({}, gameData.obChallengeScores || {});
+          scores[obChallengeDifficulty] = Math.max(scores[obChallengeDifficulty] || 0, score);
+          const updatedData = Object.assign({}, gameData, { obChallengeScores: scores });
+          setGameData(updatedData);
+          saveGameData(updatedData);
+          setObPhase('challengesComplete');
+        }
+      };
+
+      const startObStrategy = function(diff) {
+        setObStrategyDifficulty(diff);
+        const seed = Date.now();
+        setObStrategySeed(seed);
+        const rng = new SeededRandom(seed);
+        const book = generateOrderBook(100, { levels: 5, sizeMean: 300, spread: 0.15 }, rng);
+        const tv = 100 + rng.float(-2, 2);
+        setObStrategyRound(1);
+        setObStrategyBook(book);
+        setObStrategyTrueValue(tv);
+        setObStrategyPosition(0);
+        setObStrategyPnL(0);
+        setObStrategyBid({ price: (book.bestBid + 0.02).toFixed(2), size: '100' });
+        setObStrategyAsk({ price: (book.bestAsk - 0.02).toFixed(2), size: '100' });
+        setObStrategyRounds([]);
+        setObStrategyEvents([]);
+        setObPhase('strategy');
+        setGamePhase('orderBook');
+      };
+
+      const submitObStrategyOrders = function() {
+        if (!obStrategyBook) return;
+        const params = OB_STRATEGY_PARAMS[obStrategyDifficulty];
+        const rng = new SeededRandom(obStrategySeed + obStrategyRound);
+        const playerOrders = {
+          bid: { price: parseFloat(obStrategyBid.price), size: parseInt(obStrategyBid.size) || 100 },
+          ask: { price: parseFloat(obStrategyAsk.price), size: parseInt(obStrategyAsk.size) || 100 },
+        };
+        const result = simulateOBStrategyRound(obStrategyBook, playerOrders, obStrategyTrueValue, params, rng);
+        const pnlResult = calcOBStrategyPnL(result.playerFills, result.finalTrueValue);
+        const roundData = { round: obStrategyRound, book: obStrategyBook, playerOrders: playerOrders, events: result.events, fills: result.playerFills, pnl: pnlResult.pnl, position: pnlResult.position, tvStart: obStrategyTrueValue, tvEnd: result.finalTrueValue };
+        setObStrategyRounds(obStrategyRounds.concat([roundData]));
+        setObStrategyEvents(result.events);
+        setObStrategyPnL(obStrategyPnL + pnlResult.pnl);
+        setObStrategyPosition(obStrategyPosition + pnlResult.position);
+        if (obStrategyRound >= 10) {
+          const finalPnL = obStrategyPnL + pnlResult.pnl;
+          const currentBest = gameData.obStrategyBestPnL;
+          const newBest = currentBest === null ? finalPnL : Math.max(currentBest, finalPnL);
+          const updatedData = Object.assign({}, gameData, { obStrategyBestPnL: newBest });
+          setGameData(updatedData);
+          saveGameData(updatedData);
+          setObPhase('strategyComplete');
+        } else {
+          setObPhase('strategyResults');
+        }
+      };
+
+      const nextObStrategyRound = function() {
+        const lastRound = obStrategyRounds[obStrategyRounds.length - 1];
+        const rng = new SeededRandom(obStrategySeed + obStrategyRound);
+        const book = generateOrderBook(lastRound ? lastRound.tvEnd : 100, { levels: 5, sizeMean: 300, spread: rng.float(0.10, 0.20) }, rng);
+        setObStrategyRound(obStrategyRound + 1);
+        setObStrategyBook(book);
+        setObStrategyTrueValue(lastRound ? lastRound.tvEnd : 100);
+        setObStrategyBid({ price: (book.bestBid + 0.02).toFixed(2), size: '100' });
+        setObStrategyAsk({ price: (book.bestAsk - 0.02).toFixed(2), size: '100' });
+        setObPhase('strategy');
+      };
+
+      // ========================================================================
+      // RENDER: MENU
+      // ========================================================================
+
+      if (gamePhase === 'menu') {
+        const winRate = gameData.sessionHistory && gameData.sessionHistory.length > 0 ? Math.round((gameData.sessionHistory.filter(function(s) { return s.finalPnL > 0; }).length / gameData.sessionHistory.length) * 100) : 0;
+        const bestPnL = gameData.sessionHistory && gameData.sessionHistory.length > 0 ? Math.max.apply(null, gameData.sessionHistory.map(function(s) { return s.finalPnL; })) : 0;
+
+        return (
+          <div style={containerStyle}>
+            <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '8px', letterSpacing: '-0.5px' }}>MARKET MAKING GAME</h1>
+            
+            <div style={{ marginBottom: '24px', padding: '16px', border: '2px solid #000', backgroundColor: '#fafafa' }}>
+              <div style={{ fontSize: '16px', fontWeight: '600', marginBottom: '4px' }}>
+                {TIERS[tier].icon} {TIERS[tier].name.toUpperCase()}
+              </div>
+              {tier < 4 && (
+                <div style={{ fontSize: '12px', color: '#666' }}>
+                  Next: {TIERS[tier + 1].name} — {TIERS[tier].advancement}
+                </div>
+              )}
+            </div>
+            
+            {gameData.totalGamesPlayed > 0 && (
+              <p style={{ fontSize: '13px', color: '#666', marginBottom: '24px' }}>
+                {gameData.totalGamesPlayed} games • Best: {formatPnL(bestPnL)} • {winRate}% win rate
+              </p>
+            )}
+
+            {gameData.achievements && gameData.achievements.length > 0 && (
+              <div style={{ marginBottom: '24px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {gameData.achievements.slice(0, 8).map(function(id) {
+                  return <span key={id} title={ACHIEVEMENTS[id] ? ACHIEVEMENTS[id].name : ''} style={{ fontSize: '20px' }}>{ACHIEVEMENTS[id] ? ACHIEVEMENTS[id].icon : '?'}</span>;
+                })}
+                {gameData.achievements.length > 8 && <span style={{ fontSize: '14px', color: '#666' }}>+{gameData.achievements.length - 8}</span>}
+              </div>
+            )}
+            
+            {/* Tutorial */}
+            <div style={{ marginBottom: '32px' }}>
+              <button onClick={function() { startGame('easy', 'tutorial'); }} style={Object.assign({}, primaryButtonStyle, { width: '100%', marginBottom: '8px' })}>
+                {gameData.tutorialCompleted ? '↻ REPLAY TUTORIAL' : 'START TUTORIAL'}
+              </button>
+              <p style={{ fontSize: '12px', color: '#666', textAlign: 'center' }}>Learn fundamentals in 10 guided rounds</p>
+            </div>
+
+            {/* ORDER BOOK TRAINING */}
+            {isFeatureUnlocked('orderBookTraining', tier) ? (
+              <div style={{ marginBottom: '32px', padding: '20px', border: '2px solid #000', backgroundColor: '#fffbeb' }}>
+                <p style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>📊 ORDER BOOK TRAINING</p>
+                <p style={{ fontSize: '12px', color: '#666', marginBottom: '16px' }}>Master order book mechanics for trading interviews.</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <button onClick={startObTutorial} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '12px' })}>
+                    📖 Order Book Tutorial {gameData.obTutorialComplete && <span style={{ color: '#22c55e', marginLeft: '8px' }}>✓ {gameData.obTutorialScore}%</span>}
+                    <div style={{ fontSize: '10px', color: '#666', marginTop: '2px' }}>10 lessons · ~15 min</div>
+                  </button>
+                  <button onClick={function() { setObPhase('challengeSelect'); setGamePhase('orderBook'); }} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '12px' })}>
+                    🎯 Timed Challenges {gameData.obChallengeScores && gameData.obChallengeScores.easy && <span style={{ color: '#666', marginLeft: '8px', fontSize: '11px' }}>Best: {gameData.obChallengeScores.easy}%</span>}
+                    <div style={{ fontSize: '10px', color: '#666', marginTop: '2px' }}>Test your knowledge</div>
+                  </button>
+                  <button onClick={function() { setObPhase('strategySelect'); setGamePhase('orderBook'); }} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '12px' })}>
+                    ⚡ Market Maker Strategy {gameData.obStrategyBestPnL != null && <span style={{ color: gameData.obStrategyBestPnL >= 0 ? '#22c55e' : '#dc2626', marginLeft: '8px', fontSize: '11px' }}>{formatPnL(gameData.obStrategyBestPnL)}</span>}
+                    <div style={{ fontSize: '10px', color: '#666', marginTop: '2px' }}>Place orders, capture spread</div>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginBottom: '32px', padding: '16px', backgroundColor: '#f5f5f5', opacity: 0.6 }}>
+                <p style={{ fontSize: '13px' }}>🔒 Order Book Training — Unlock at Tier 1 (Apprentice)</p>
+              </div>
+            )}
+
+            {/* Random Mix */}
+            <div style={{ marginBottom: '32px', padding: '20px', border: '2px solid #000', backgroundColor: '#fafafa' }}>
+              <p style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>🎲 RANDOM MIX</p>
+              <p style={{ fontSize: '12px', color: '#666', marginBottom: '16px' }}>Randomly generated market conditions.</p>
+              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                {['easy', 'medium', 'hard'].map(function(diff) {
+                  return (
+                    <button key={diff} onClick={function() { startGame(diff, 'randomMix'); }} style={Object.assign({}, buttonStyle, { flex: '1', padding: '10px' })}>
+                      {diff.charAt(0).toUpperCase() + diff.slice(1)}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Scenarios */}
+            <div style={{ marginBottom: '32px' }}>
+              <p style={{ fontSize: '14px', fontWeight: '600', marginBottom: '12px' }}>📚 SCENARIOS</p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {Object.keys(SCENARIO_BASES).map(function(key) {
+                  const scenario = SCENARIO_BASES[key];
+                  return (
+                    <button key={key} onClick={function() { startGame('medium', 'scenario', key); }} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '12px' })}>
+                      <span style={{ fontWeight: '600' }}>{scenario.label}</span>
+                      <div style={{ fontSize: '11px', color: '#666', marginTop: '4px' }}>{scenario.description}</div>
+                      {gameData.scenariosCompleted && gameData.scenariosCompleted[key] && <span style={{ color: '#22c55e', fontSize: '11px' }}> ✓</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Pattern Training */}
+            {isFeatureUnlocked('patternRecognition', tier) && (
+              <div style={{ marginBottom: '32px' }}>
+                <button onClick={startPatternTraining} style={Object.assign({}, buttonStyle, { width: '100%' })}>
+                  🧠 Pattern Recognition Training
+                  {gameData.patternHighScore > 0 && <span style={{ marginLeft: '8px', color: '#666' }}>Best: {gameData.patternHighScore}%</span>}
+                </button>
+              </div>
+            )}
+
+            {/* History & Achievements */}
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button onClick={function() { setGamePhase('history'); }} style={Object.assign({}, buttonStyle, { flex: 1 })}>📜 History</button>
+              <button onClick={function() { setGamePhase('achievements'); }} style={Object.assign({}, buttonStyle, { flex: 1 })}>🏆 Achievements</button>
+            </div>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: ORDER BOOK TRAINING
+      // ========================================================================
+
+      if (gamePhase === 'orderBook') {
+        // Challenge Select
+        if (obPhase === 'challengeSelect') {
+          return (
+            <div style={containerStyle}>
+              <h2 style={{ fontSize: '20px', fontWeight: '500', marginBottom: '16px' }}>🎯 Select Difficulty</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+                {['easy', 'medium', 'hard'].map(function(diff) {
+                  return (
+                    <button key={diff} onClick={function() { startObChallenges(diff); }} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '16px' })}>
+                      <div style={{ fontWeight: '600' }}>{diff.charAt(0).toUpperCase() + diff.slice(1)}</div>
+                      <div style={{ fontSize: '11px', color: '#666' }}>{diff === 'easy' ? '10 questions · 25 sec' : diff === 'medium' ? '15 questions · 35 sec' : '20 questions · 50 sec'}</div>
+                      {gameData.obChallengeScores && gameData.obChallengeScores[diff] && <div style={{ fontSize: '11px', color: '#22c55e', marginTop: '4px' }}>Best: {gameData.obChallengeScores[diff]}%</div>}
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>← Back</button>
+            </div>
+          );
+        }
+
+        // Strategy Select
+        if (obPhase === 'strategySelect') {
+          return (
+            <div style={containerStyle}>
+              <h2 style={{ fontSize: '20px', fontWeight: '500', marginBottom: '16px' }}>⚡ Select Difficulty</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+                {['easy', 'medium', 'hard'].map(function(diff) {
+                  return (
+                    <button key={diff} onClick={function() { startObStrategy(diff); }} style={Object.assign({}, buttonStyle, { textAlign: 'left', padding: '16px' })}>
+                      <div style={{ fontWeight: '600' }}>{diff.charAt(0).toUpperCase() + diff.slice(1)}</div>
+                      <div style={{ fontSize: '11px', color: '#666' }}>{diff === 'easy' ? '70% noise · ±500 limit' : diff === 'medium' ? '25% informed · ±300 limit' : '40% informed · ±150 limit'}</div>
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>← Back</button>
+            </div>
+          );
+        }
+
+        // Tutorial
+        if (obPhase === 'tutorial') {
+          const lesson = OB_TUTORIAL[obTutorialLesson];
+          return (
+            <div style={containerStyle}>
+              <p style={{ fontSize: '12px', color: '#666', marginBottom: '8px' }}>Lesson {obTutorialLesson + 1}/{OB_TUTORIAL.length}</p>
+              <h2 style={{ fontSize: '18px', fontWeight: '600', marginBottom: '4px' }}>{lesson.title}</h2>
+              <p style={{ fontSize: '12px', color: '#666', marginBottom: '16px' }}>{lesson.concept}</p>
+              <div style={{ backgroundColor: '#f5f5f5', padding: '12px', marginBottom: '16px', fontSize: '12px' }}>
+                {lesson.teaching.map(function(p, i) { return <p key={i} style={{ marginBottom: i < lesson.teaching.length - 1 ? '6px' : 0 }}>• {p}</p>; })}
+              </div>
+              {lesson.book && <OrderBookDisplay book={lesson.book} />}
+              {lesson.twoBooks && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '12px' }}>
+                  <div><p style={{ fontSize: '11px', fontWeight: '600', marginBottom: '4px' }}>BOOK A</p><OrderBookDisplay book={lesson.twoBooks.A} compact={true} /></div>
+                  <div><p style={{ fontSize: '11px', fontWeight: '600', marginBottom: '4px' }}>BOOK B</p><OrderBookDisplay book={lesson.twoBooks.B} compact={true} /></div>
+                </div>
+              )}
+              <div style={{ padding: '14px', border: '2px solid #000' }}>
+                <p style={{ fontWeight: '600', marginBottom: '10px' }}>{lesson.question}</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {lesson.options.map(function(opt, i) {
+                    let bg = '#fff';
+                    if (obTutorialShowFeedback) { if (i === lesson.correct) bg = '#dcfce7'; else if (i === obTutorialSelected) bg = '#fee2e2'; }
+                    return (
+                      <button key={i} onClick={function() { if (!obTutorialShowFeedback) handleObTutorialAnswer(i); }} disabled={obTutorialShowFeedback}
+                        style={Object.assign({}, buttonStyle, { backgroundColor: bg, textAlign: 'left', opacity: obTutorialShowFeedback && i !== lesson.correct && i !== obTutorialSelected ? 0.5 : 1 })}>
+                        {String.fromCharCode(65 + i)}) {opt}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {obTutorialShowFeedback && (
+                <div style={{ marginTop: '14px', padding: '14px', backgroundColor: obTutorialSelected === lesson.correct ? '#dcfce7' : '#fee2e2' }}>
+                  <p style={{ fontWeight: '600', marginBottom: '6px' }}>{obTutorialSelected === lesson.correct ? '✓ Correct!' : '✗ Incorrect'}</p>
+                  <p style={{ fontSize: '13px' }}>{lesson.explanation}</p>
+                  <button onClick={nextObTutorialLesson} style={Object.assign({}, primaryButtonStyle, { marginTop: '10px' })}>
+                    {obTutorialLesson < OB_TUTORIAL.length - 1 ? 'Next Lesson →' : 'Complete Tutorial'}
+                  </button>
+                </div>
+              )}
+              <button onClick={function() { setGamePhase('menu'); }} style={Object.assign({}, smallButtonStyle, { marginTop: '14px' })}>← Exit</button>
+            </div>
+          );
+        }
+
+        // Tutorial Complete
+        if (obPhase === 'tutorialComplete') {
+          const correctCount = obTutorialAnswers.filter(function(a) { return a.correct; }).length;
+          const score = Math.round((correctCount / OB_TUTORIAL.length) * 100);
+          return (
+            <div style={containerStyle}>
+              <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '16px' }}>📖 Tutorial Complete!</h1>
+              <div style={{ fontSize: '48px', fontWeight: '600', marginBottom: '8px' }}>{score}%</div>
+              <p style={{ fontSize: '14px', marginBottom: '24px' }}>{correctCount}/{OB_TUTORIAL.length} correct</p>
+              <div style={{ display: 'flex', gap: '12px' }}>
+                <button onClick={startObTutorial} style={buttonStyle}>Retry</button>
+                <button onClick={function() { setGamePhase('menu'); }} style={primaryButtonStyle}>Back to Menu</button>
+              </div>
+            </div>
+          );
+        }
+
+        // Challenges
+        if (obPhase === 'challenges' && obChallengeSet) {
+          const q = obChallengeSet.questions[obChallengeQ];
+          const totalPoints = obChallengeAnswers.reduce(function(s, a) { return s + a.points; }, 0);
+          return (
+            <div style={containerStyle}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
+                <div><p style={{ fontSize: '12px', color: '#666' }}>Q{obChallengeQ + 1}/{obChallengeSet.questions.length}</p><p style={{ fontSize: '11px', color: '#666' }}>{q.type}</p></div>
+                <div style={{ textAlign: 'right' }}><p style={{ fontSize: '18px', fontWeight: '600', color: obChallengeTimeLeft < 10 ? '#dc2626' : '#000' }}>⏱ {obChallengeTimeLeft}s</p><p style={{ fontSize: '12px', color: '#666' }}>Score: {totalPoints}</p></div>
+              </div>
+              {q.book && <OrderBookDisplay book={q.book} compact={true} />}
+              {q.twoBooks && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '12px' }}>
+                  <div><p style={{ fontSize: '11px', fontWeight: '600', marginBottom: '4px' }}>BOOK A</p><OrderBookDisplay book={q.twoBooks.A} compact={true} /></div>
+                  <div><p style={{ fontSize: '11px', fontWeight: '600', marginBottom: '4px' }}>BOOK B</p><OrderBookDisplay book={q.twoBooks.B} compact={true} /></div>
+                </div>
+              )}
+              <div style={{ padding: '14px', border: '2px solid #000' }}>
+                <p style={{ fontWeight: '600', marginBottom: '10px' }}>{q.question}</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {q.options.map(function(opt, i) {
+                    let bg = '#fff';
+                    if (obChallengeShowFeedback) { if (i === q.correct) bg = '#dcfce7'; else if (i === obChallengeSelected) bg = '#fee2e2'; }
+                    return (
+                      <button key={i} onClick={function() { if (!obChallengeShowFeedback) handleObChallengeAnswer(i); }} disabled={obChallengeShowFeedback}
+                        style={Object.assign({}, buttonStyle, { backgroundColor: bg, textAlign: 'left' })}>
+                        {String.fromCharCode(65 + i)}) {opt}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {obChallengeShowFeedback && (
+                <div style={{ marginTop: '14px', padding: '14px', backgroundColor: obChallengeSelected === q.correct ? '#dcfce7' : '#fee2e2' }}>
+                  <p style={{ fontWeight: '600', marginBottom: '6px' }}>{obChallengeSelected === q.correct ? '✓ +' + (obChallengeAnswers[obChallengeAnswers.length - 1] ? obChallengeAnswers[obChallengeAnswers.length - 1].points : 10) : '✗ Incorrect'}</p>
+                  <p style={{ fontSize: '13px' }}>{q.explanation}</p>
+                  <button onClick={nextObChallenge} style={Object.assign({}, primaryButtonStyle, { marginTop: '10px' })}>
+                    {obChallengeQ < obChallengeSet.questions.length - 1 ? 'Next →' : 'See Results'}
+                  </button>
+                </div>
+              )}
+              <button onClick={function() { setGamePhase('menu'); }} style={Object.assign({}, smallButtonStyle, { marginTop: '14px' })}>← Exit</button>
+            </div>
+          );
+        }
+
+        // Challenges Complete
+        if (obPhase === 'challengesComplete' && obChallengeSet) {
+          const correctCount = obChallengeAnswers.filter(function(a) { return a.correct; }).length;
+          const score = Math.round((correctCount / obChallengeSet.questions.length) * 100);
+          const grade = score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
+          return (
+            <div style={containerStyle}>
+              <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '16px' }}>🎯 Challenges Complete!</h1>
+              <div style={{ display: 'flex', gap: '24px', marginBottom: '24px' }}>
+                <div><p style={{ fontSize: '48px', fontWeight: '600' }}>{grade}</p><p style={{ fontSize: '12px', color: '#666' }}>Grade</p></div>
+                <div><p style={{ fontSize: '48px', fontWeight: '600' }}>{score}%</p><p style={{ fontSize: '12px', color: '#666' }}>{correctCount}/{obChallengeSet.questions.length}</p></div>
+              </div>
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                <button onClick={function() { startObChallenges(obChallengeDifficulty); }} style={buttonStyle}>Retry</button>
+                <button onClick={function() { setObPhase('challengeSelect'); }} style={buttonStyle}>Change Difficulty</button>
+                <button onClick={function() { setGamePhase('menu'); }} style={primaryButtonStyle}>Back to Menu</button>
+              </div>
+            </div>
+          );
+        }
+
+        // Strategy
+        if (obPhase === 'strategy' && obStrategyBook) {
+          const params = OB_STRATEGY_PARAMS[obStrategyDifficulty];
+          const playerSpread = parseFloat(obStrategyAsk.price) - parseFloat(obStrategyBid.price);
+          const isValid = !isNaN(playerSpread) && playerSpread > 0;
+          return (
+            <div style={containerStyle}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
+                <div><p style={{ fontSize: '12px', color: '#666' }}>Round {obStrategyRound}/10 · {obStrategyDifficulty.toUpperCase()}</p><p style={{ fontSize: '11px', color: '#666' }}>Limit: ±{params.posLimit}</p></div>
+                <div style={{ textAlign: 'right' }}><p style={{ fontSize: '18px', fontWeight: '600', color: obStrategyPnL >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(obStrategyPnL)}</p><p style={{ fontSize: '12px', color: '#666' }}>Pos: {obStrategyPosition}</p></div>
+              </div>
+              <OrderBookDisplay book={obStrategyBook} />
+              <div style={{ padding: '14px', backgroundColor: '#f5f5f5', border: '1px solid #ddd' }}>
+                <p style={{ fontWeight: '600', fontSize: '12px', marginBottom: '10px' }}>PLACE YOUR ORDERS</p>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                  <div>
+                    <p style={{ fontSize: '11px', color: '#666', marginBottom: '4px' }}>BID (Buy)</p>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <input type="number" value={obStrategyBid.size} onChange={function(e) { setObStrategyBid({ price: obStrategyBid.price, size: e.target.value }); }} style={Object.assign({}, inputStyle, { width: '60px', padding: '8px' })} />
+                      <span style={{ alignSelf: 'center' }}>@</span>
+                      <input type="number" step="0.01" value={obStrategyBid.price} onChange={function(e) { setObStrategyBid({ price: e.target.value, size: obStrategyBid.size }); }} style={Object.assign({}, inputStyle, { flex: '1', padding: '8px' })} />
+                    </div>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '11px', color: '#666', marginBottom: '4px' }}>ASK (Sell)</p>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <input type="number" value={obStrategyAsk.size} onChange={function(e) { setObStrategyAsk({ price: obStrategyAsk.price, size: e.target.value }); }} style={Object.assign({}, inputStyle, { width: '60px', padding: '8px' })} />
+                      <span style={{ alignSelf: 'center' }}>@</span>
+                      <input type="number" step="0.01" value={obStrategyAsk.price} onChange={function(e) { setObStrategyAsk({ price: e.target.value, size: obStrategyAsk.size }); }} style={Object.assign({}, inputStyle, { flex: '1', padding: '8px' })} />
+                    </div>
+                  </div>
+                </div>
+                <div style={{ marginTop: '8px', fontSize: '12px' }}>Spread: ${playerSpread.toFixed(2)} {isValid ? '✓' : <span style={{ color: '#dc2626' }}>⚠</span>}</div>
+              </div>
+              <button onClick={submitObStrategyOrders} disabled={!isValid} style={Object.assign({}, primaryButtonStyle, { width: '100%', marginTop: '14px', opacity: isValid ? 1 : 0.5 })}>Submit Orders</button>
+              <button onClick={function() { setGamePhase('menu'); }} style={Object.assign({}, smallButtonStyle, { marginTop: '10px' })}>← Exit</button>
+            </div>
+          );
+        }
+
+        // Strategy Results
+        if (obPhase === 'strategyResults') {
+          const lastRound = obStrategyRounds[obStrategyRounds.length - 1];
+          return (
+            <div style={containerStyle}>
+              <h2 style={{ fontSize: '18px', fontWeight: '500', marginBottom: '14px' }}>Round {lastRound ? lastRound.round : '?'} Results</h2>
+              <div style={{ marginBottom: '14px', padding: '14px', backgroundColor: lastRound && lastRound.pnl >= 0 ? '#dcfce7' : '#fee2e2' }}>
+                <p style={{ fontSize: '24px', fontWeight: '600' }}>{formatPnL(lastRound ? lastRound.pnl : 0)}</p>
+                <p style={{ fontSize: '12px', color: '#666' }}>Round P&L</p>
+              </div>
+              <div style={{ marginBottom: '14px' }}>
+                <p style={{ fontWeight: '600', marginBottom: '6px' }}>Events:</p>
+                {obStrategyEvents.map(function(e, i) { return <p key={i} style={{ fontSize: '12px', marginBottom: '2px' }}>{e.type === 'news' ? '📰' : '👤'} {e.desc}</p>; })}
+              </div>
+              {lastRound && lastRound.fills && lastRound.fills.length > 0 && (
+                <div style={{ marginBottom: '14px' }}>
+                  <p style={{ fontWeight: '600', marginBottom: '6px' }}>Your Fills:</p>
+                  {lastRound.fills.map(function(f, i) { return <p key={i} style={{ fontSize: '12px' }}>{f.side === 'buy' ? 'Bought' : 'Sold'} {f.size} @ ${f.price.toFixed(2)}</p>; })}
+                </div>
+              )}
+              <div style={{ fontSize: '13px', marginBottom: '14px' }}>
+                <p>True Value: ${lastRound && lastRound.tvStart ? lastRound.tvStart.toFixed(2) : '?'} → ${lastRound && lastRound.tvEnd ? lastRound.tvEnd.toFixed(2) : '?'}</p>
+                <p>Total P&L: {formatPnL(obStrategyPnL)}</p>
+                <p>Position: {obStrategyPosition}</p>
+              </div>
+              <button onClick={nextObStrategyRound} style={Object.assign({}, primaryButtonStyle, { width: '100%' })}>Next Round →</button>
+            </div>
+          );
+        }
+
+        // Strategy Complete
+        if (obPhase === 'strategyComplete') {
+          const roundsWithFills = obStrategyRounds.filter(function(r) { return r.fills && r.fills.length > 0; }).length;
+          const fillRate = roundsWithFills / Math.max(1, obStrategyRounds.length);
+          return (
+            <div style={containerStyle}>
+              <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '16px' }}>⚡ Strategy Complete!</h1>
+              <div style={{ fontSize: '48px', fontWeight: '600', marginBottom: '8px', color: obStrategyPnL >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(obStrategyPnL)}</div>
+              <p style={{ fontSize: '12px', color: '#666', marginBottom: '24px' }}>Final P&L</p>
+              <div style={{ marginBottom: '24px', fontSize: '13px' }}>
+                <p>Fill Rate: {Math.round(fillRate * 100)}%</p>
+                <p>Final Position: {obStrategyPosition}</p>
+              </div>
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                <button onClick={function() { startObStrategy(obStrategyDifficulty); }} style={buttonStyle}>Play Again</button>
+                <button onClick={function() { setObPhase('strategySelect'); }} style={buttonStyle}>Change Difficulty</button>
+                <button onClick={function() { setGamePhase('menu'); }} style={primaryButtonStyle}>Back to Menu</button>
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div style={containerStyle}>
+            <p>Loading...</p>
+            <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>← Back</button>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: HISTORY
+      // ========================================================================
+
+      if (gamePhase === 'history') {
+        return (
+          <div style={containerStyle}>
+            <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '24px' }}>SESSION HISTORY</h1>
+            {!gameData.sessionHistory || gameData.sessionHistory.length === 0 ? (
+              <p style={{ color: '#666' }}>No sessions yet. Play a game to see your history!</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+                {gameData.sessionHistory.slice().reverse().slice(0, 10).map(function(s) {
+                  return (
+                    <div key={s.id} style={{ padding: '12px', border: '1px solid #ddd', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <div style={{ fontWeight: '600' }}>{s.mode} - {s.difficulty}</div>
+                        <div style={{ fontSize: '12px', color: '#666' }}>{new Date(s.date).toLocaleDateString()}</div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontWeight: '600', color: s.finalPnL >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(s.finalPnL)}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>← Back to Menu</button>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: ACHIEVEMENTS
+      // ========================================================================
+
+      if (gamePhase === 'achievements') {
+        return (
+          <div style={containerStyle}>
+            <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '24px' }}>ACHIEVEMENTS</h1>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+              {Object.keys(ACHIEVEMENTS).map(function(id) {
+                const ach = ACHIEVEMENTS[id];
+                const unlocked = gameData.achievements && gameData.achievements.indexOf(ach.id) !== -1;
+                return (
+                  <div key={ach.id} style={{ padding: '12px', border: '1px solid #ddd', opacity: unlocked ? 1 : 0.4, display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <span style={{ fontSize: '24px' }}>{ach.icon}</span>
+                    <div>
+                      <div style={{ fontWeight: '600' }}>{ach.name}</div>
+                      <div style={{ fontSize: '12px', color: '#666' }}>{ach.description}</div>
+                    </div>
+                    {unlocked && <span style={{ marginLeft: 'auto', color: '#22c55e' }}>✓</span>}
+                  </div>
+                );
+              })}
+            </div>
+            <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>← Back to Menu</button>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: PATTERN TRAINING
+      // ========================================================================
+
+      if (gamePhase === 'patternTraining') {
+        const q = patternQuestions[patternCurrentQ];
+        return (
+          <div style={containerStyle}>
+            <p style={{ fontSize: '12px', color: '#666', marginBottom: '16px' }}>Question {patternCurrentQ + 1} / {patternQuestions.length}</p>
+            <h2 style={{ fontSize: '16px', fontWeight: '500', marginBottom: '24px' }}>{q.question}</h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+              {q.options.map(function(opt, i) {
+                let bg = '#fff';
+                if (patternShowFeedback) {
+                  if (i === q.correct) bg = '#dcfce7';
+                  else if (i === patternSelectedAnswer) bg = '#fee2e2';
+                }
+                return (
+                  <button key={i} onClick={function() { if (!patternShowFeedback) handlePatternAnswer(i); }} disabled={patternShowFeedback}
+                    style={Object.assign({}, buttonStyle, { textAlign: 'left', backgroundColor: bg, opacity: patternShowFeedback && i !== q.correct && i !== patternSelectedAnswer ? 0.5 : 1 })}>
+                    {String.fromCharCode(65 + i)}) {opt}
+                  </button>
+                );
+              })}
+            </div>
+            {patternShowFeedback && (
+              <div style={{ padding: '16px', backgroundColor: patternSelectedAnswer === q.correct ? '#dcfce7' : '#fee2e2', marginBottom: '24px' }}>
+                <p style={{ fontWeight: '600', marginBottom: '8px' }}>{patternSelectedAnswer === q.correct ? '✓ Correct!' : '✗ Incorrect'}</p>
+                <p style={{ fontSize: '14px' }}>{q.explanation}</p>
+                <button onClick={nextPatternQuestion} style={Object.assign({}, primaryButtonStyle, { marginTop: '16px' })}>
+                  {patternCurrentQ < patternQuestions.length - 1 ? 'Next Question' : 'See Results'}
+                </button>
+              </div>
+            )}
+            <button onClick={function() { setGamePhase('menu'); }} style={smallButtonStyle}>← Exit</button>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: PATTERN COMPLETE
+      // ========================================================================
+
+      if (gamePhase === 'patternComplete') {
+        const correctCount = patternAnswers.filter(function(a) { return a.correct; }).length;
+        const score = Math.round((correctCount / patternAnswers.length) * 100);
+        return (
+          <div style={containerStyle}>
+            <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '24px' }}>TRAINING COMPLETE</h1>
+            <div style={{ fontSize: '48px', fontWeight: '600', marginBottom: '24px' }}>{score}%</div>
+            <p style={{ fontSize: '16px', marginBottom: '24px' }}>{correctCount} / {patternAnswers.length} correct</p>
+            {newAchievements.length > 0 && (
+              <div style={{ backgroundColor: '#fef3c7', padding: '16px', marginBottom: '24px' }}>
+                <p style={{ fontWeight: '600', marginBottom: '8px' }}>🏆 New Achievement!</p>
+                {newAchievements.map(function(a) { return <div key={a.id}>{a.icon} {a.name}</div>; })}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button onClick={startPatternTraining} style={primaryButtonStyle}>Try Again</button>
+              <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>Back to Menu</button>
+            </div>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: GAME OVER
+      // ========================================================================
+
+      if (gamePhase === 'gameover') {
+        return (
+          <div style={containerStyle}>
+            <h1 style={{ fontSize: '24px', fontWeight: '500', marginBottom: '8px' }}>GAME OVER</h1>
+            {gameOverReason && <p style={{ color: '#dc2626', marginBottom: '16px' }}>{gameOverReason}</p>}
+            
+            <div style={{ fontSize: '48px', fontWeight: '600', color: totalPnL >= 0 ? '#22c55e' : '#dc2626', marginBottom: '8px' }}>
+              {formatPnL(totalPnL)}
+            </div>
+            <p style={{ fontSize: '14px', color: '#666', marginBottom: '24px' }}>Final P&L</p>
+            
+            <div style={{ marginBottom: '24px' }}>
+              <MetricRow label="Rounds" value={round + '/' + maxRounds} />
+              <MetricRow label="Total Trades" value={stats.totalTrades} />
+              <MetricRow label="Max Position" value={stats.maxPosition} status={stats.maxPosition <= (config.positionLimit || 50) ? 'good' : 'bad'} />
+            </div>
+            
+            {newAchievements.length > 0 && (
+              <div style={{ backgroundColor: '#fef3c7', padding: '16px', marginBottom: '24px' }}>
+                <p style={{ fontWeight: '600', marginBottom: '8px' }}>🏆 New Achievements!</p>
+                {newAchievements.map(function(a) { return <div key={a.id}>{a.icon} {a.name}</div>; })}
+              </div>
+            )}
+            
+            <div style={{ display: 'flex', gap: '12px' }}>
+              <button onClick={function() { startGame(difficulty, gameMode, scenarioType); }} style={primaryButtonStyle}>Play Again</button>
+              <button onClick={function() { setGamePhase('menu'); }} style={buttonStyle}>Menu</button>
+            </div>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: RESULTS
+      // ========================================================================
+
+      if (gamePhase === 'results' && roundResult) {
+        return (
+          <div style={containerStyle}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '24px' }}>
+              <span>Round {round}/{maxRounds}</span>
+              <span style={{ fontWeight: '600', color: totalPnL >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(totalPnL)}</span>
+            </div>
+
+            <h2 style={{ fontSize: '18px', fontWeight: '500', marginBottom: '16px' }}>Round Results</h2>
+            
+            {trades.length === 0 ? (
+              <p style={{ color: '#666', marginBottom: '24px' }}>No trades this round.</p>
+            ) : (
+              <div style={{ marginBottom: '24px' }}>
+                {trades.map(function(t, i) {
+                  return (
+                    <div key={i} style={{ padding: '8px', marginBottom: '8px', backgroundColor: t.pnl >= 0 ? '#dcfce7' : '#fee2e2' }}>
+                      <span style={{ fontWeight: '600' }}>{t.botType}</span> {t.type === 'buy' ? 'bought' : 'sold'} {t.size} @ ${formatPrice(t.price)}
+                      <span style={{ marginLeft: '8px', color: t.pnl >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(t.pnl)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div style={{ marginBottom: '24px' }}>
+              <MetricRow label="Position" value={position} status={Math.abs(position) > (config ? config.positionLimit : 50) * 0.8 ? 'bad' : 'good'} />
+              <MetricRow label="True Value" value={'$' + formatPrice(trueValue)} />
+            </div>
+
+            <button onClick={nextRound} style={Object.assign({}, primaryButtonStyle, { width: '100%' })}>
+              {round >= maxRounds ? 'Finish Game' : 'Next Round →'}
+            </button>
+          </div>
+        );
+      }
+
+      // ========================================================================
+      // RENDER: PLAYING
+      // ========================================================================
+
+      return (
+        <div style={containerStyle}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', borderBottom: '2px solid #000', marginBottom: '24px', fontSize: '14px' }}>
+            <span>Round {round}/{maxRounds}</span>
+            <span>Position: {position}</span>
+            <span style={{ fontWeight: '600', color: totalPnL >= 0 ? '#22c55e' : '#dc2626' }}>{formatPnL(totalPnL)}</span>
+          </div>
+
+          {gameMode === 'tutorial' && tutorialConfig && (
+            <div style={{ backgroundColor: '#fffde7', padding: '16px', marginBottom: '24px', border: '1px solid #ffd54f' }}>
+              <p style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '8px', color: '#666' }}>💡 {tutorialConfig.title}</p>
+              <p style={{ fontSize: '14px' }}>{tutorialConfig.tip}</p>
+            </div>
+          )}
+
+          <div style={{ marginBottom: '32px' }}>
+            <div style={{ textAlign: 'center', padding: '16px', backgroundColor: '#f5f5f5', marginBottom: '24px', fontSize: '14px' }}>
+              {gameMode === 'tutorial' && tutorialConfig && tutorialConfig.showTrueValue ? (
+                <span>True Value: <span style={{ fontWeight: '600' }}>${formatPrice(trueValue)} ± $1.00</span></span>
+              ) : (
+                <span>True Value: <span style={{ fontWeight: '600' }}>Hidden</span></span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '24px', justifyContent: 'center', marginBottom: '24px' }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '12px', textTransform: 'uppercase', color: '#666', marginBottom: '8px' }}>Your Bid (Buy)</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <button onClick={function() { setBidPrice(function(p) { return Math.round((p - 0.05) * 100) / 100; }); }} style={smallButtonStyle}>−</button>
+                  <div style={{ fontSize: '24px', fontWeight: '600', minWidth: '100px' }}>${formatPrice(bidPrice)}</div>
+                  <button onClick={function() { setBidPrice(function(p) { return Math.round((p + 0.05) * 100) / 100; }); }} style={smallButtonStyle}>+</button>
+                </div>
+              </div>
+              
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '12px', textTransform: 'uppercase', color: '#666', marginBottom: '8px' }}>Your Ask (Sell)</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <button onClick={function() { setAskPrice(function(p) { return Math.round((p - 0.05) * 100) / 100; }); }} style={smallButtonStyle}>−</button>
+                  <div style={{ fontSize: '24px', fontWeight: '600', minWidth: '100px' }}>${formatPrice(askPrice)}</div>
+                  <button onClick={function() { setAskPrice(function(p) { return Math.round((p + 0.05) * 100) / 100; }); }} style={smallButtonStyle}>+</button>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+              <span style={{ fontSize: '14px', color: spread < MIN_SPREAD ? '#c00' : '#666' }}>
+                Spread: ${spread.toFixed(2)} {spread < MIN_SPREAD && '(min $0.10)'}
+              </span>
+            </div>
+
+            <button onClick={submitQuotes} disabled={spread < MIN_SPREAD} style={Object.assign({}, primaryButtonStyle, { width: '100%', opacity: spread < MIN_SPREAD ? 0.5 : 1 })}>
+              Submit Quotes
+            </button>
+          </div>
+
+          <button onClick={function() { if (confirm('Exit game? Progress will be lost.')) setGamePhase('menu'); }} style={Object.assign({}, buttonStyle, { fontSize: '12px', padding: '8px 16px' })}>
+            ← Exit Game
+          </button>
+        </div>
+      );
+    }
+
+    // Render the app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<MarketMakingGame />);
+  </script>
+</body>
+</html>
