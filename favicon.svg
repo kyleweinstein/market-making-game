@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="The Seer eye">
+  <rect width="64" height="64" fill="#FAFAF7"/>
+  <path fill="#111111" d="M4 26C15 8 49 8 60 26L52 34C42 18 22 18 12 34Z"/>
+  <path fill="#111111" d="M4 38C15 56 49 56 60 38L52 30C42 46 22 46 12 30Z"/>
+  <circle cx="32" cy="32" r="10.5" fill="#FF3B00"/>
+  <path fill="#FAFAF7" d="M30.5 21.5h3V27h-3z"/>
+</svg>
